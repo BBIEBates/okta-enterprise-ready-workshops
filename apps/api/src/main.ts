@@ -1,6 +1,7 @@
 import express from 'express';
 import { PrismaClient, Todo, User } from '@prisma/client';
 import passportLocal from 'passport-local';
+import passportOIDC from 'passport-openidconnect';
 import passport from 'passport';
 import session from 'express-session';
 
@@ -10,6 +11,7 @@ interface IUser {
 
 const prisma = new PrismaClient();
 const LocalStrategy = passportLocal.Strategy;
+const OpenIDConnectStrategy = passportOIDC.Strategy;
 
 const app = express();
 app.use(express.json())
@@ -19,7 +21,7 @@ app.use(session({
   secret: 'top secret',
   cookie: {
     http: false,
-    sameSite: 'strict'
+    sameSite: 'lax'
   }
 }));
 app.use(passport.initialize());
@@ -81,17 +83,17 @@ app.post('/api/signout', async (req, res, next) => {
   
 });
 
-app.get('/api/users/me', async (req, res) => {
-  const user: User = await prisma.user.findUnique({
-    where: {
-      id: req.user['id']
-    }
-  });
+// app.get('/api/users/me', async (req, res) => {
+//   const user: User = await prisma.user.findUnique({
+//     where: {
+//       id: req.user['id']
+//     }
+//   });
 
-  delete user.password;
+//   delete user.password;
 
-  res.json({...user});
-});
+//   res.json({...user});
+// });
 
 app.get('/api/todos', async ( req, res) => {
   const todos: Todo[] = await prisma.todo.findMany({
@@ -109,7 +111,8 @@ app.post('/api/todos', async (req, res) => {
     data: {
       task,
       completed: false,
-      user : { connect: {id}}
+      user: { connect: {id}},
+      org: { connect: {id: req.user['orgId']}}
     }
   })
 
@@ -147,3 +150,149 @@ const server = app.listen(port, () => {
   console.log(`Listening at http://localhost:${port}/api`);
 });
 server.on('error', console.error);
+
+
+////////////////////////////////////////////
+// OpenID Connect Routes Below
+
+function getDomainFromEmail(email) {
+  let domain;
+  try {
+    domain = email.split('@')[1];
+  } catch(e) {
+    return null;
+  }
+  return domain;
+}
+
+app.post('/api/openid/check', async (req, res, next) => {
+  const { username } = req.body;
+
+  const domain = getDomainFromEmail(username);
+  if(domain) {
+    // eslint-disable-next-line no-var
+    var org = await prisma.org.findFirst({
+      where: {
+        domain: domain
+      }
+    });
+    if(!org) {
+      org = await prisma.org.findFirst({
+        where: {
+          User: {
+            some: {
+              email: username
+            }
+          }
+        }
+      })
+    }
+    if(org && org.issuer) {
+      return res.json({ org_id: org.id });
+    }
+  }
+
+  res.json({ org_id: null });
+});
+
+function createStrategy(org) {
+  return new OpenIDConnectStrategy({
+    issuer: org.issuer,
+    authorizationURL: org.authorization_endpoint,
+    tokenURL: org.token_endpoint,
+    userInfoURL: org.userinfo_endpoint,
+    clientID: org.client_id,
+    clientSecret: org.client_secret,
+    scope: 'profile email',
+    callbackURL: 'http://localhost:3333/openid/callback/'+org.id
+  },
+  async function verify(issuer, profile, cb) {
+
+    // Passport.js runs this verify function after successfully completing
+    // the OIDC flow, and gives this app a chance to do something with
+    // the response from the OIDC server, like create users on the fly.
+
+    // eslint-disable-next-line no-var
+    var user = await prisma.user.findFirst({
+      where: {
+        orgId: org.id,
+        externalId: profile.id,
+      }
+    })
+
+    if(!user) {
+      user = await prisma.user.findFirst({
+        where: {
+          orgId: org.id,
+          email: profile.emails[0].value,
+        }
+      })
+      if(user) {
+        await prisma.user.update({
+          where: {id: user.id},
+          data: {externalId: profile.id}
+        })
+      }
+    }
+
+    if(!user) {
+      user = await prisma.user.create({
+        data: {
+          org: {connect: {id: org.id}},
+          externalId: profile.id,
+          email: profile.emails[0].value,
+          name: profile.displayName,
+        }
+      })
+    }
+
+    return cb(null, user);
+  })
+}
+
+
+async function orgFromId(id) {
+  const org = await prisma.org.findFirst({
+    where: {
+      id: parseInt(id)
+    }
+  })
+  return org
+}
+
+// The frontend then redirects here to have the backend start the OIDC flow.
+// (You should probably use random IDs, not auto-increment integers
+// to avoid revealing how many enterprise customers you have.)
+app.get('/openid/start/:id', async (req, res, next) => {
+
+  const org = await orgFromId(req.params.id);
+  if(!org) {
+    return res.sendStatus(404);
+  }
+
+  const strategy = createStrategy(org);
+  if(!strategy) {
+    return res.sendStatus(404);
+  }
+
+  passport.authenticate(strategy)(req, res, next);
+
+});
+
+app.get('/openid/callback/:id', async (req, res, next) => {
+
+  const org = await orgFromId(req.params.id);
+  if(!org) {
+    return res.sendStatus(404);
+  }
+
+  const strategy = createStrategy(org);
+  if(!strategy) {
+    return res.sendStatus(404);
+  }
+
+  passport.authenticate(strategy, {
+    successRedirect: 'http://localhost:3000/'
+  })(req, res, next);
+
+});
