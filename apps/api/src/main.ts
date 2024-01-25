@@ -83,17 +83,17 @@ app.post('/api/signout', async (req, res, next) => {
   
 });
 
-// app.get('/api/users/me', async (req, res) => {
-//   const user: User = await prisma.user.findUnique({
-//     where: {
-//       id: req.user['id']
-//     }
-//   });
+app.get('/api/users/me', async (req, res) => {
+  const user: User = await prisma.user.findUnique({
+    where: {
+      id: req.user['id']
+    }
+  });
 
-//   delete user.password;
+  delete user.password;
 
-//   res.json({...user});
-// });
+  res.json({...user});
+});
 
 app.get('/api/todos', async ( req, res) => {
   const todos: Todo[] = await prisma.todo.findMany({
@@ -212,21 +212,21 @@ function createStrategy(org) {
     // the OIDC flow, and gives this app a chance to do something with
     // the response from the OIDC server, like create users on the fly.
 
-    // eslint-disable-next-line no-var
-    var user = await prisma.user.findFirst({
+    let user = await prisma.user.findFirst({
       where: {
         orgId: org.id,
         externalId: profile.id,
       }
-    })
+    });
 
+    //check to see if user with email address exsits. if so, add external ID from their org
     if(!user) {
       user = await prisma.user.findFirst({
         where: {
           orgId: org.id,
           email: profile.emails[0].value,
         }
-      })
+      });      
       if(user) {
         await prisma.user.update({
           where: {id: user.id},
